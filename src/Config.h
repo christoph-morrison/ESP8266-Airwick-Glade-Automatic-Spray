@@ -12,9 +12,9 @@ namespace Config {
 
     void save() {
         DynamicJsonDocument json(512);
-        json["mqtt_server"] = mqtt_server;
-        json["username"]    = username;
-        json["password"]    = password;
+        json["mqtt_server"]  = mqtt_server;
+        json["username"]     = username;
+        json["password"]     = password;
 
         File configFile = LittleFS.open("/config.json", "w");
 
