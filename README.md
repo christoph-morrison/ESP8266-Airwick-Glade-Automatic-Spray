@@ -1,1 +1,2 @@
-# MQTT controllable Glade / Airwick Automatic Spray
+# ESP8266-Airwick-Glade-Automatic-Spray
+Glade / Airwick Automatic Spray with MQTT and manual access
