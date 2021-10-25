@@ -6,13 +6,15 @@
 #include <PubSubClient.h>
 #include <WiFiManager.h>
 #include <Config.h>
+#include <Counter.h>
 #include <Bounce2.h>
 
 uint8_t mqttRetryCounter = 0;
 
-const u_int PIN_SPRAY_POWER_SUPPLY = D5;
+const u_int PIN_MOSFET_POWER_SUPPLY = D5;
 const u_int PIN_MANUAL_BUTTON = D6;
-const u_int POWER_ON_TIME = 7000;
+const u_int POWER_ON_TIME = 9000;
+const u_int MQTT_DELAY = 1500;
 
 WiFiManager  wifiManager;
 WiFiClient   wifiClient;
@@ -30,16 +32,18 @@ uint32_t keepAlivePreviousMillis = 0;
 const uint16_t keepAlivePublishInterval = 60000 * 1;
 
 uint32_t networkPreviousMillis = 0;
-const uint32_t networkPublishInterval = 60000 * 30;
+const uint32_t networkPublishInterval = 60000 * 5;
 
 char identifier[30];
 #define FIRMWARE_PREFIX "esp8266-air-fragrancer"
 #define AVAILABILITY_ONLINE "online"
 #define AVAILABILITY_OFFLINE "offline"
-char MQTT_TOPIC_AVAILABILITY[128];
-char MQTT_TOPIC_STATE[128];
-char MQTT_TOPIC_KEEP_ALIVE[128];
-char MQTT_TOPIC_COMMAND[128];
+char MQTT_TOPIC_AVAILABILITY[256];
+char MQTT_TOPIC_NETWORK[256];
+char MQTT_TOPIC_KEEP_ALIVE[256];
+char MQTT_TOPIC_BURSTCOUNTER[256];
+char MQTT_TOPIC_COMMAND[256];
+char MQTT_TOPIC_COMMANDSTATE[256];
 
 bool shouldSaveConfig = false;
 bool initDone = false;
@@ -108,7 +112,9 @@ void setupWifi() {
 }
 
 void resetWifiSettingsAndReboot() {
+    Config::reset();
     wifiManager.resetSettings();
+    WiFi.disconnect(true);
     delay(3000);
     ESP.restart();
 }
@@ -122,7 +128,7 @@ void mqttReconnect() {
             mqttClient.subscribe(MQTT_TOPIC_COMMAND);
             break;
         }
-        delay(5000);
+        delay(MQTT_DELAY);
     }
 }
 
@@ -131,18 +137,45 @@ bool isMqttConnected() {
 }
 
 void init_output_pin() {
-  pinMode(PIN_SPRAY_POWER_SUPPLY, OUTPUT);
-  digitalWrite(PIN_SPRAY_POWER_SUPPLY, LOW);
+  pinMode(PIN_MOSFET_POWER_SUPPLY, OUTPUT);
+  digitalWrite(PIN_MOSFET_POWER_SUPPLY, LOW);
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, HIGH);
 }
 
+void publishBurstCounter() {
+    char message_buf[512];
+    String raw;
+    Counter::raw(raw);
+    raw.toCharArray(message_buf, raw.length() + 1);
+    mqttClient.publish(&MQTT_TOPIC_BURSTCOUNTER[0], message_buf, true);
+}
+
+void publishDeviceState(const String& message) {
+    mqttReconnect();
+    char message_buf[256];
+    message.toCharArray(message_buf, message.length() + 1);
+    mqttClient.publish(&MQTT_TOPIC_COMMANDSTATE[0], message_buf, false);
+}
+
+void incrementCounter() {
+    Counter::burstCounterInstance++;
+    Counter::burstCounterOverall++;
+    Counter::save();
+    Serial.printf("New burst counted, now %li bursts (%li overall)\n", 
+        Counter::burstCounterInstance, Counter::burstCounterOverall);
+    publishBurstCounter();
+}
+
 void power_output() {
-  digitalWrite(PIN_SPRAY_POWER_SUPPLY, HIGH);
-  digitalWrite(LED_BUILTIN, LOW);
-  delay(POWER_ON_TIME);
-  digitalWrite(PIN_SPRAY_POWER_SUPPLY, LOW);
-  digitalWrite(LED_BUILTIN, HIGH);
+    publishDeviceState("on");
+    digitalWrite(PIN_MOSFET_POWER_SUPPLY, HIGH);
+    digitalWrite(LED_BUILTIN, LOW);
+    delay(POWER_ON_TIME);
+    digitalWrite(PIN_MOSFET_POWER_SUPPLY, LOW);
+    digitalWrite(LED_BUILTIN, HIGH);
+    incrementCounter();
+    publishDeviceState("off");
 }
 
 void publishKeepAlive() {
@@ -157,21 +190,68 @@ void publishNetworkState() {
     DynamicJsonDocument stateJson(1024);
     char payload[256];
 
-    wifiJson["ssid"]    = WiFi.SSID();
-    wifiJson["ip"]      = WiFi.localIP().toString();
-    wifiJson["rssi"]    = WiFi.RSSI();
+    wifiJson["ssid"]        = WiFi.SSID();
+    wifiJson["ip"]          = WiFi.localIP().toString();
+    wifiJson["rssi"]        = WiFi.RSSI();
 
-    stateJson["wifi"]   = wifiJson.as<JsonObject>();
+    stateJson["wifi"]       = wifiJson.as<JsonObject>();
 
     serializeJson(stateJson, payload);
-    mqttClient.publish(&MQTT_TOPIC_STATE[0], &payload[0], true);
+    mqttClient.publish(&MQTT_TOPIC_NETWORK[0], &payload[0], true);
+}
+
+void resetInstanceCounter() {
+    Serial.println("Instance burst counter reset received");
+
+    publishDeviceState("reset-instance-counter");
+    Counter::resetInstanceCounter();
+    publishBurstCounter();
+    delay(1000);
+    publishDeviceState("off");
+    mqttReconnect();
+}
+
+void resetAllCounter() {
+    Serial.println("All counter reset received");
+
+    publishDeviceState("reset-all-counter");
+    Counter::resetAllCounter();
+    publishBurstCounter();
+    delay(1000);
+    publishDeviceState("off");
+    mqttReconnect();
+}
+
+void resetConfig() {
+    publishDeviceState("reset-config");
+    delay(1000);
+    publishDeviceState("gone");
+    Serial.println("Config reset received");
+    resetWifiSettingsAndReboot();
+}
+
+void resetAll() {
+    Serial.println("Complete reset received");
+    publishDeviceState("reset-all");
+    delay(1000);
+    publishDeviceState("goodbye and thank you for the fish");
+    delay(1000);
+    publishDeviceState("the cake is a lie");
+    delay(1000);
+    Counter::resetAllCounter();
+    resetWifiSettingsAndReboot();
+}
+
+void publishUpdate() {
+    publishBurstCounter();
+    publishNetworkState();
 }
 
 void mqttCallback(char* topic, uint8_t* payload, unsigned int length) { 
 
-    Serial.print("Received message [");
+    Serial.print("Received message [on topic ");
     Serial.print(topic);
-    Serial.print("] ");
+    Serial.print("]: ");
 
     char msg[length+1];
     
@@ -183,10 +263,33 @@ void mqttCallback(char* topic, uint8_t* payload, unsigned int length) {
     Serial.println();
  
     msg[length] = '\0';
-    Serial.println(msg);
  
-    if(strcmp(msg, "on" ) ==  0 || strcmp(msg, "1") == 0) {
-      power_output();
+    if( strcmp(topic, MQTT_TOPIC_COMMAND) == 0) {
+    
+        if ( ( strcmp(msg, "on" ) ==  0 || strcmp(msg, "1") == 0) ) {
+            Serial.println("Power on received via MQTT command");
+            power_output();
+        }
+
+        if ( strcmp(msg, "reset-instance-counter") == 0 ) {
+            resetInstanceCounter();
+        }
+
+        if ( strcmp(msg, "reset-all-counter") == 0 ) {
+            resetAllCounter();
+        }
+
+        if ( strcmp(msg, "reset-config") == 0 ) {
+            resetConfig();
+        }
+
+        if ( strcmp(msg, "reset-all") == 0 ) {
+            resetAll();
+        }
+
+        if ( strcmp(msg, "update") == 0 ) {
+            publishUpdate();
+        }
     }
 }
 
@@ -201,14 +304,16 @@ void setup() {
     Serial.printf("CPU Frequency: %u MHz\n", ESP.getCpuFreqMHz());
     Serial.printf("Reset reason: %s\n", ESP.getResetReason().c_str());
 
-    delay(3000);
+    delay(MQTT_DELAY);
 
     snprintf(identifier, sizeof(identifier), "%s-%X", FIRMWARE_PREFIX, ESP.getChipId());
-    snprintf(MQTT_TOPIC_AVAILABILITY, 127,   "%s/%X/connection",  mqttTopicPrefix.c_str(), ESP.getChipId());
-    snprintf(MQTT_TOPIC_STATE, 127,          "%s/%X/state",       mqttTopicPrefix.c_str(), ESP.getChipId());
-    snprintf(MQTT_TOPIC_COMMAND, 127,        "%s/%X/command",     mqttTopicPrefix.c_str(), ESP.getChipId());
-    snprintf(MQTT_TOPIC_KEEP_ALIVE, 127,     "%s/%X/keep-alive",  mqttTopicPrefix.c_str(), ESP.getChipId());
-
+    snprintf(MQTT_TOPIC_AVAILABILITY, 255,   "%s/%X/connection",    mqttTopicPrefix.c_str(), ESP.getChipId());
+    snprintf(MQTT_TOPIC_NETWORK, 255,        "%s/%X/network",       mqttTopicPrefix.c_str(), ESP.getChipId());
+    snprintf(MQTT_TOPIC_COMMAND, 255,        "%s/%X/command",       mqttTopicPrefix.c_str(), ESP.getChipId());
+    snprintf(MQTT_TOPIC_KEEP_ALIVE, 255,     "%s/%X/keep-alive",    mqttTopicPrefix.c_str(), ESP.getChipId());
+    snprintf(MQTT_TOPIC_BURSTCOUNTER, 255,   "%s/%X/burst-counter", mqttTopicPrefix.c_str(), ESP.getChipId());
+    snprintf(MQTT_TOPIC_COMMANDSTATE, 255,   "%s/%X/device-state",  mqttTopicPrefix.c_str(), ESP.getChipId());
+    
     WiFi.hostname(identifier);
 
     Config::load();
@@ -220,19 +325,34 @@ void setup() {
     mqttClient.setBufferSize(2048);
     mqttClient.setCallback(mqttCallback);
 
+    Serial.println("-- Network configuration --");
     Serial.printf("Hostname: %s\n", identifier);
     Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
-    Serial.println("-- Current GPIO Configuration --");
+    Serial.println();
+    
+    Serial.println("-- GPIO configuration --");
     Serial.printf("Button pin: %d\n", PIN_MANUAL_BUTTON);
-    Serial.printf("MOSFET control pin: %d\n", PIN_SPRAY_POWER_SUPPLY);
+    Serial.printf("MOSFET control pin: %d\n", PIN_MOSFET_POWER_SUPPLY);
+    Serial.println();
+
+    Serial.println("-- Persistent storage --");
+    Counter::load();
+    Serial.printf("Instance: %li bursts\n", Counter::burstCounterInstance);
+    Serial.printf("Overall:  %li bursts\n", Counter::burstCounterOverall);
+    Serial.println();
 
     mqttReconnect();
+
+    publishDeviceState("boot");
 
     button.attach( PIN_MANUAL_BUTTON , INPUT_PULLUP );
     button.interval(5); 
     button.setPressedState(LOW); 
 
     init_output_pin();
+    publishBurstCounter();
+
+    publishDeviceState("off");
 }
 
 void loop() {
@@ -241,19 +361,26 @@ void loop() {
     button.update();
 
     if (initDone == false) {
-        Serial.print("Process initial config informations: ");
-        
+        Serial.printf("Process initial config informations:\n");
+                
+        Serial.printf("  - network,\n");
         publishNetworkState();
-        Serial.print("network, ");
         
+        Serial.printf("  - keep-alive: ");
         publishKeepAlive();
-        Serial.print("keep-alive, ");
-        
-        Serial.println("done");
+                
+        Serial.println("done!");
+        Serial.println("Starting normal operation\n");
         initDone = true;
     }
 
+    if ( button.pressed() ) {
+        Serial.println("Manual burst requested.\n");
+        power_output();
+    }
+
     const uint32_t currentMillis = millis();
+
     if (currentMillis - keepAlivePreviousMillis >= keepAlivePublishInterval) {
         keepAlivePreviousMillis = currentMillis;
         publishKeepAlive();
@@ -264,13 +391,11 @@ void loop() {
         publishNetworkState();
     }
 
-    if ( button.pressed() ) {
-        power_output();
-    }
- 
     if (!mqttClient.connected() && currentMillis - lastMqttConnectionAttempt >= mqttConnectionInterval) {
         lastMqttConnectionAttempt = currentMillis;
         printf("Reconnect mqtt\n");
+
+        publishBurstCounter();
         mqttReconnect();
     }
 }
