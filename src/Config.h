@@ -47,4 +47,8 @@ namespace Config {
             }
         }
     }
+
+    void reset() {
+        LittleFS.remove("/config.json");
+    }
 }
